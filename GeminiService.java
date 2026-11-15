@@ -1,8 +1,11 @@
 package competitor_research;
 
 import com.google.genai.Client;
+import com.google.genai.types.FinishReason;
 import com.google.genai.types.GenerateContentConfig;
 import com.google.genai.types.GenerateContentResponse;
+import com.google.genai.types.Schema;
+import com.google.genai.types.Type;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.ObjectMapper;
 
@@ -71,29 +74,50 @@ public class GeminiService {
         String prompt = """
                 Analyze the company "%s" as a business analyst.
                 %s
-                Return ONLY valid JSON matching this schema (no markdown):
-                {
-                  "companyName": "%s",
-                  "sourceNote": "%s",
-                  "overview": "2 concise sentences on what the company does and its market",
-                  "products": ["Product 1", "Product 2", "Product 3"],
-                  "competitors": [
-                    {
-                      "name": "Competitor Name",
-                      "mainProduct": "Main competing product",
-                      "howItCompares": "1 short sentence comparing them"
-                    }
-                  ],
-                  "strengths": ["Short point 1", "Short point 2", "Short point 3"],
-                  "weaknesses": ["Short point 1", "Short point 2", "Short point 3"]
-                }
-                Include exactly 3 key competitors. Keep every field brief and factual.
-                """.formatted(cleanCompany, groundingSection, cleanCompany, sourceNote);
+                Include exactly 3 key competitors, 3 products, 3 strengths, and 3 weaknesses.
+                Keep every field brief, factual, and concise.
+                """.formatted(cleanCompany, groundingSection);
+
+        Schema competitorItemSchema = Schema.builder()
+                .type(Type.Known.OBJECT)
+                .properties(Map.of(
+                        "name", Schema.builder().type(Type.Known.STRING).build(),
+                        "mainProduct", Schema.builder().type(Type.Known.STRING).build(),
+                        "howItCompares", Schema.builder().type(Type.Known.STRING).build()
+                ))
+                .required(List.of("name", "mainProduct", "howItCompares"))
+                .build();
+
+        Schema reportSchema = Schema.builder()
+                .type(Type.Known.OBJECT)
+                .properties(Map.of(
+                        "companyName", Schema.builder().type(Type.Known.STRING).build(),
+                        "overview", Schema.builder().type(Type.Known.STRING).build(),
+                        "products", Schema.builder()
+                                .type(Type.Known.ARRAY)
+                                .items(Schema.builder().type(Type.Known.STRING).build())
+                                .build(),
+                        "competitors", Schema.builder()
+                                .type(Type.Known.ARRAY)
+                                .items(competitorItemSchema)
+                                .build(),
+                        "strengths", Schema.builder()
+                                .type(Type.Known.ARRAY)
+                                .items(Schema.builder().type(Type.Known.STRING).build())
+                                .build(),
+                        "weaknesses", Schema.builder()
+                                .type(Type.Known.ARRAY)
+                                .items(Schema.builder().type(Type.Known.STRING).build())
+                                .build()
+                ))
+                .required(List.of("companyName", "overview", "products", "competitors", "strengths", "weaknesses"))
+                .build();
 
         GenerateContentConfig config = GenerateContentConfig.builder()
                 .responseMimeType("application/json")
+                .responseSchema(reportSchema)
                 .temperature(0.2F)
-                .maxOutputTokens(1000)
+                .maxOutputTokens(4096)
                 .build();
 
         GenerateContentResponse response = client.models.generateContent(
@@ -102,10 +126,18 @@ public class GeminiService {
                 config
         );
 
-        CompetitorReport rawReport = objectMapper.readValue(response.text(), CompetitorReport.class);
+        if (response.finishReason().isPresent()
+                && response.finishReason().get().knownEnum() == FinishReason.Known.MAX_TOKENS) {
+            throw new IllegalStateException("AI response exceeded token limit before finishing JSON.");
+        }
+
+        String jsonText = cleanJson(response.text());
+        CompetitorReport rawReport = objectMapper.readValue(jsonText, CompetitorReport.class);
 
         CompetitorReport finalReport = new CompetitorReport(
-                rawReport.companyName(),
+                rawReport.companyName() != null && !rawReport.companyName().isBlank()
+                        ? rawReport.companyName()
+                        : cleanCompany,
                 sourceNote,
                 rawReport.overview(),
                 rawReport.products(),
@@ -117,6 +149,18 @@ public class GeminiService {
 
         reportCache.put(cacheKey, finalReport);
         return finalReport;
+    }
+
+    private String cleanJson(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalStateException("Gemini returned an empty response.");
+        }
+        String trimmed = raw.trim();
+        if (trimmed.startsWith("```")) {
+            trimmed = trimmed.replaceFirst("^```(?:json)?\\s*", "");
+            trimmed = trimmed.replaceFirst("\\s*```$", "");
+        }
+        return trimmed.trim();
     }
 
     public List<String> getRecentCompanies() {
