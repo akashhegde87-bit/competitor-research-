@@ -1,6 +1,7 @@
 package competitor_research;
 
 import com.google.genai.Client;
+import com.google.genai.errors.ApiException;
 import com.google.genai.types.FinishReason;
 import com.google.genai.types.GenerateContentConfig;
 import com.google.genai.types.GenerateContentResponse;
@@ -67,8 +68,13 @@ public class GeminiService {
                 ? "Grounded with live web search results (" + searchContext.sources().size() + " sources)"
                 : "AI-generated analysis (live web search unavailable)";
 
+        String trimmedSnippets = searchContext.formattedSnippets();
+        if (trimmedSnippets != null && trimmedSnippets.length() > 6000) {
+            trimmedSnippets = trimmedSnippets.substring(0, 6000);
+        }
+
         String groundingSection = searchContext.liveGrounded()
-                ? "Use these live web snippets as primary context:\n" + searchContext.formattedSnippets()
+                ? "Use these live web snippets as primary context:\n" + trimmedSnippets
                 : "Rely on general business knowledge.";
 
         String prompt = """
@@ -120,11 +126,16 @@ public class GeminiService {
                 .maxOutputTokens(4096)
                 .build();
 
-        GenerateContentResponse response = client.models.generateContent(
-                MODEL_ID,
-                prompt,
-                config
-        );
+        GenerateContentResponse response;
+        try {
+            response = client.models.generateContent(MODEL_ID, prompt, config);
+        } catch (ApiException e) {
+            if (e.code() == 429) {
+                response = client.models.generateContent("gemini-3.5-flash-lite", prompt, config);
+            } else {
+                throw e;
+            }
+        }
 
         if (response.finishReason().isPresent()
                 && response.finishReason().get().knownEnum() == FinishReason.Known.MAX_TOKENS) {
@@ -156,21 +167,4 @@ public class GeminiService {
             throw new IllegalStateException("Gemini returned an empty response.");
         }
         String trimmed = raw.trim();
-        if (trimmed.startsWith("```")) {
-            trimmed = trimmed.replaceFirst("^```(?:json)?\\s*", "");
-            trimmed = trimmed.replaceFirst("\\s*```$", "");
-        }
-        return trimmed.trim();
-    }
-
-    public List<String> getRecentCompanies() {
-        synchronized (reportCache) {
-            List<String> companies = new ArrayList<>();
-            for (CompetitorReport report : reportCache.values()) {
-                companies.add(report.companyName());
-            }
-            Collections.reverse(companies);
-            return companies;
-        }
-    }
-}
+        if (trimmed.
